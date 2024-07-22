@@ -1,4 +1,4 @@
-FROM cmk:2.3.0p7
+FROM ghcr.io/marian-babik/cmk-etf:2.3.0p7
 
 LABEL maintainer="Marian Babik <Marian.Babik@cern.ch>"
 LABEL description="ETF perfSONAR"
