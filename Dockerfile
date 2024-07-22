@@ -20,6 +20,9 @@ RUN curl -s https://raw.githubusercontent.com/perfsonar/project/master/install-p
 # python path fix
 COPY ./config/sitecustomize.py /omd/sites/etf/lib/python3.12/
 
+# pscheduler troubleshoot fix (to use system py3.9 not cmk's 3.12)
+RUN sed '1 s|^.*$|#!/usr/bin/env python3.9|' -i /usr/libexec/pscheduler/commands/troubleshoot
+
 # Install
 COPY ./src/check_ps /usr/lib64/nagios/plugins/
 COPY ./src/check_ps_es /usr/lib64/nagios/plugins/
