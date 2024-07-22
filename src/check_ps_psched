@@ -1,0 +1,93 @@
+#!/bin/env python3
+#
+# check_ps_es_srv - checks perfSONAR pscheduler status and reports basic stats
+#
+# Author: Marian Babik
+# Copyright CERN 2017
+#
+
+
+import requests
+import requests.exceptions
+import socket
+import logging
+
+import nap.core
+
+# suppress InsecureRequestWarning: Unverified HTTPS request is being made.
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+log = logging.getLogger("nap")
+
+app = nap.core.Plugin(description="Checks metadata in esmond wrt. tests configured in the mesh config")
+app.add_argument('--hostcert', help='Path to hostcert.pem')
+app.add_argument('--hostkey', help='Path to hostkey.pem')
+app.add_argument('-T', '--requests-timeout', dest="req_timeout", default=60, type=int,
+                 help='Timeout for HTTP(s) requests')
+#app.add_argument('--connect-non-critical', action='store_true', default=False, dest='con_not_critical',
+#                 help='Failing to connect will not be reported as critical')
+
+
+def request(args, url):
+    req_error = None
+    psched_meta = None
+    try:
+        psched_meta = requests.get("http://" + url, timeout=args.req_timeout, headers={'Host': args.hostname})
+        psched_meta.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        req_error = str(e)
+
+    if req_error:  # https request as fallback
+        try:
+            psched_meta = requests.get("https://" + url, timeout=args.req_timeout, headers={'Host': args.hostname},
+                                       verify=False, cert=(args.hostcert, args.hostkey))
+            psched_meta.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            req_error = str(e)
+        else:
+            req_error = None
+    return req_error, psched_meta
+
+
+@app.metric()
+def test_psched_meta(args, io):
+    if not (args.hostname or args.hostcert or args.hostkey or args.events):
+        io.status = nap.UNKNOWN
+        io.summary = "Missing plugin arguments"
+        return
+
+    # requests
+    host = socket.gethostbyname(args.hostname)  # force IPv4
+
+    # pending
+    log.debug(host + '/pscheduler/stat/runs/pending')
+    req_error, psm = request(args, args.hostname + '/pscheduler/stat/runs/pending')
+
+    if req_error:
+        # fallback to IPv4 only
+        req_error, psm = request(args, host + '/pscheduler/stat/runs/pending')
+        if req_error:
+            io.summary = "Error connecting to pscheduler API (IPv4 or IPv6)"
+            io.status = nap.CRITICAL
+            return
+
+    io.add_perf_data("pending", int(psm.content))
+
+    states = ['running', 'overdue', 'missed', 'failed', 'nonstart', 'finished']
+    for state in states:
+        log.debug(host + '/pscheduler/stat/runs/'+state)
+        req_error, psm = request(args, host + '/pscheduler/stat/runs/'+state)
+        io.add_perf_data(state, int(psm.content))
+
+    log.debug(host + '/pscheduler//stat/archiving/backlog')
+    req_error, psm = request(args, host + '/pscheduler/stat/archiving/backlog')
+    io.add_perf_data('archiver_backlog', int(psm.content))
+
+    io.summary = "pscheduler stats retrieved"
+    io.status = nap.OK
+
+
+if __name__ == '__main__':
+    app.run()
+

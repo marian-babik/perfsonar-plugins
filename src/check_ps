@@ -1,0 +1,408 @@
+#!/bin/env python
+#
+# check_ps -  checks perfSONAR toolkit installation
+#
+# Author: Marian Babik
+# Copyright CERN 2017
+#
+
+
+import requests
+import requests.exceptions
+import socket
+import json
+import logging
+import distutils.version
+import os
+import time
+
+import nap.core
+import nap.dq
+
+# suppress InsecureRequestWarning: Unverified HTTPS request is being made.
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+log = logging.getLogger("nap")
+
+
+def print_docs():
+    print("Documentation can be found at https://opensciencegrid.org/networking/perfsonar/faq/")
+
+
+def check_deps(io):
+    if not hasattr(app, "toolkit_meta"):
+        io.status = nap.UNKNOWN
+        io.summary = "Masked by perfSONAR JSON Summary - CRITICAL/UNKNOWN"
+        return True
+    return False
+
+
+app = nap.core.Plugin(description="Checks basic properties of perfSONAR Toolkit")
+app.add_argument('--hostcert', help='Path to hostcert.pem')
+app.add_argument('--hostkey', help='Path to hostkey.pem')
+app.add_argument('-T', '--requests-timeout', dest="req_timeout", default=60, type=int,
+                 help='Timeout for HTTP(s) requests')
+app.add_argument('--target-version', help="Target toolkit version", default="4.0")
+app.add_argument('--target-memory', help="Target amount of memory on the toolkit", default=4, type=int)
+app.add_argument('--dirq', help="Directory queue for summaries", default="/var/spool/nstream/outgoing")
+app.add_argument('--topic', help="Topic for summaries")
+app.add_argument('--cache-dir', dest='cache_dir', help="Cache directory to store intermediate results")
+
+
+@app.metric(metric_name="perfSONAR json summary", seq=1)
+def test_summary(args, io):
+    if not args.hostname:
+        io.status = nap.UNKNOWN
+        io.summary = "Missing plugin arguments (hostname is mandatory)"
+        return
+    if args.cache_dir:
+        if not os.path.isdir(args.cache_dir):
+            try:
+                os.mkdir(args.cache_dir)
+            except OSError as e:
+                io.status = nap.UNKNOWN
+                io.summary = "Failed to create cache directory (%s)" % args.cache_dir
+                return
+
+    # build URL
+    host = socket.gethostbyname(args.hostname)  # force IPv4
+    url = host + '/toolkit/services/host.cgi?method=get_summary'
+
+    # http request
+    log.debug(url)
+    req_error = None
+    try:
+        req_meta = requests.get("http://" + url, timeout=args.req_timeout, headers={'Host': args.hostname})
+        req_meta.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        req_error = str(e)
+
+    if req_error:  # https request as fallback
+        try:
+            req_meta = requests.get("https://" + url, timeout=args.req_timeout, headers={'Host': args.hostname},
+                                    verify=False, cert=(args.hostcert, args.hostkey))
+            req_meta.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            req_error = str(e)
+        else:
+            req_error = None
+
+    if req_error:
+        io.status = nap.CRITICAL
+        io.summary = "Connection failed (%s)" % req_error
+        return
+
+    try:
+        app.toolkit_meta = json.loads(req_meta.text)
+    except Exception as e:
+        io.status = nap.UNKNOWN
+        io.summary = "Unable to parse toolkit metadata"
+        return
+
+    # fix external hostname
+    if 'external_address' in list(app.toolkit_meta.keys()) and 'dns_name' in list(app.toolkit_meta['external_address'].keys()) and \
+            app.toolkit_meta['external_address']['dns_name'].strip().lower() != args.hostname:
+        app.toolkit_meta['external_address']['dns_name'] = args.hostname
+        # fix external_address entries for multi_nic nodes
+        if 'interfaces' in list(app.toolkit_meta.keys()):
+            for interface in app.toolkit_meta['interfaces']:
+                if interface['hostnames']:
+                    for ip, hosts in list(interface['hostnames'].items()):
+                        if args.hostname in hosts:
+                            app.toolkit_meta['external_address']['address'] = interface['ipv4_address']
+                            app.toolkit_meta['external_address']['ipv4_address'] = interface['ipv4_address'][0]
+                            app.toolkit_meta['external_address']['ipv6_address'] = interface['ipv6_address'][0]
+                            app.toolkit_meta['external_address']['counters'] = interface['counters']
+                            app.toolkit_meta['external_address']['mtu'] = interface['mtu']
+                            app.toolkit_meta['external_address']['speed'] = interface['speed']
+                            app.toolkit_meta['external_address']['iface'] = interface['iface']
+
+    if args.dirq and args.topic and args.cache_dir:
+        json_cache = os.path.join(args.cache_dir, args.hostname)
+        try:
+            if not os.path.exists(json_cache) or (os.path.exists(json_cache) and
+                                                  (time.time() - os.path.getmtime(json_cache) > 86400)):
+                nap.dq.enqueue(dirq=args.dirq, destination=args.topic, event=app.toolkit_meta)
+                with open(json_cache, "w") as jc_file:
+                    json.dump(app.toolkit_meta, jc_file)
+        except Exception as e:
+            io.status = nap.WARNING
+            io.summary = "Toolkit meta-data successfully retrieved, but failed to submit results to MQ"
+            print(str(e))
+            return
+    io.status = nap.OK
+    io.summary = "Toolkit metadata successfully retrieved"
+
+
+@app.metric(metric_name="perfSONAR services: versions", passive=True)
+def test_sw(args, io):
+    if check_deps(io):
+        return
+    if 'toolkit_version' not in list(app.toolkit_meta.keys()):
+        io.status = nap.CRITICAL
+        io.summary = "Unable to find toolkit version in metadata"
+        return
+    toolkit_version = app.toolkit_meta['toolkit_version']
+    if args.target_version:
+        if distutils.version.LooseVersion(toolkit_version) >= distutils.version.LooseVersion(str(args.target_version)):
+            io.status = nap.OK
+            io.summary = "Toolkit version found: %s" % toolkit_version
+        elif 'el6' in toolkit_version:
+            io.status = nap.CRITICAL
+            io.summary = 'SL6 detected, toolkit version found: %s' % toolkit_version
+            print("This node is running an OS distribution that will become unsupported very soon. ")
+            print("Please upgrade to CC7 as soon as possible and consider enabling auto-updates.")
+        else:
+            io.status = nap.CRITICAL
+            io.summary = "Outdated version found: %s" % toolkit_version
+            print("This node is running an outdated version of the perfSONAR toolkit, which could expose your site to")
+            print("potential security risks. Please update as soon as possible and consider enabling auto-updates.")
+    else:
+        io.status = nap.OK
+        io.summary = "Toolkit version found: %s" % toolkit_version
+    print("\nDetailed service versions:")
+    for entry in app.toolkit_meta['services']:
+        print("%s: %s" % (entry['name'], entry['version']))
+    print("Distribution: %s" % str(app.toolkit_meta.get('distribution', 'unknown')))
+    print_docs()
+
+
+@app.metric(metric_name="perfSONAR services: http/https", passive=True)
+def test_home(args, io):
+    if not hasattr(app, "toolkit_meta"):
+        io.status = nap.CRITICAL
+        io.summary = "Toolkit homepage unreachable"
+        print_docs()
+    else:
+        io.status = nap.OK
+        io.summary = "Toolkit homepage reachable"
+
+
+@app.metric(metric_name="perfSONAR services: ndt/npad disabled", passive=True)
+def test_ndt_npad(args, io):
+    if check_deps(io):
+        return
+    ndt = [entry for entry in app.toolkit_meta['services'] if entry['name'] in ['ndt']]
+    npad = [entry for entry in app.toolkit_meta['services'] if entry['name'] in ['npad']]
+    if not (ndt and npad):
+        io.status = nap.OK
+        io.summary = "NDT/NPAD disabled"
+        return
+    ndt = ndt[0]
+    npad = npad[0]
+    if not (ndt['is_running'] == 'disabled' and ndt['enabled'] == 0):
+        io.status = nap.CRITICAL
+        io.summary = "NDT enabled and/or running"
+        print_docs()
+        return
+    if not (npad['is_running'] == 'disabled' and npad['enabled'] == 0):
+        io.status = nap.CRITICAL
+        io.summary = "NPAD enabled and/or running"
+        print_docs()
+        return
+    io.status = nap.OK
+    io.summary = "NDT/NPAD disabled and not running"
+    print_docs()
+
+
+@app.metric(metric_name="perfSONAR services: ntp", passive=True)
+def test_ntp(args, io):
+    if check_deps(io):
+        return
+    if 'ntp' not in list(app.toolkit_meta.keys()):
+        io.status = nap.UNKNOWN
+        io.summary = "Unable to parse NTP status information"
+    if app.toolkit_meta['ntp']['synchronized'] == "1":
+        io.status = nap.OK
+        io.summary = "NTP synchronized"
+    else:
+        io.status = nap.CRITICAL
+        io.summary = "NTP not synchronized"
+        print_docs()
+    if all(key in ['delay', 'dispersion', 'offset'] for key in list(app.toolkit_meta['ntp'].keys())):
+        io.add_perf_data("delay", app.toolkit_meta['ntp']['delay'])
+        io.add_perf_data("dispersion", app.toolkit_meta['ntp']['dispersion'])
+        io.add_perf_data("offset", app.toolkit_meta['ntp']['offset'])
+
+    for k, v in app.toolkit_meta['ntp'].items():
+        print("%s: %s" % (str(k), str(v)))
+    print_docs()
+
+
+@app.metric(metric_name="perfSONAR services: regular testing/pscheduler", passive=True)
+def test_psched(args, io):
+    if check_deps(io):
+        return
+    psched = [entry for entry in app.toolkit_meta['services'] if entry['name'] in ['pscheduler']]
+    regt = [entry for entry in app.toolkit_meta['services'] if entry['name'] in ['regular_testing']]
+    if not (psched or regt):
+        io.status = nap.UNKNOWN
+        io.summary = "Unable to parse RegularTesting/pscheduler status"
+        print_docs()
+        return
+    if psched and not (psched[0]['is_running'] == 'yes' and psched[0].get('enabled', "1") == "1"):
+        io.status = nap.CRITICAL
+        io.summary = "pscheduler not enabled/running"
+        print_docs()
+        return
+    if regt and not (regt[0]['is_running'] == 'yes' and regt[0].get('enabled', "1") == "1"):
+        io.status = nap.CRITICAL
+        io.summary = "regular testing not enabled/running"
+        print_docs()
+        return
+    io.status = nap.OK
+    if psched:
+        io.summary = "pscheduler is enabled and running"
+    if regt:
+        io.summary = "Regular testing is enabled and running"
+
+
+@app.metric(metric_name="perfSONAR configuration: meshes", passive=True)
+def test_meshes(args, io):
+    if check_deps(io):
+        return
+    key = 'meshes'
+    if 'templates' in list(app.toolkit_meta.keys()):
+        key = 'templates'
+    if key not in list(app.toolkit_meta.keys()):
+        io.status = nap.CRITICAL
+        io.summary = "Unable to parse mesh configuration"
+        print_docs()
+        return
+    if key in list(app.toolkit_meta.keys()) and not app.toolkit_meta[key]:
+        io.status = nap.CRITICAL
+        io.summary = "No meshes configured"
+        print_docs()
+        return
+    configured_meshes = app.toolkit_meta[key]
+    try:
+        host = socket.getfqdn(args.hostname)
+    except Exception as e:
+        io.status = nap.UNKNOWN
+        io.summary = "Failed to get FQDN for %s" % args.hostname
+        return
+
+    psconfig_ip = socket.gethostbyname('psconfig.opensciencegrid.org')
+
+    valid_meshes = ['meshconfig.grid.iu.edu/pub/auto/' + host, 'meshconfig.grid.iu.edu/pub/auto/' + args.hostname,
+                     'psconfig.opensciencegrid.org/pub/auto/' + host,
+                     'psconfig-itb.opensciencegrid.org/pub/auto/' + host,
+                     'psconfig.opensciencegrid.org/pub/auto/' + args.hostname,
+                     'psconfig-itb.opensciencegrid.org/pub/auto/' + args.hostname,
+                     'meshconfig.opensciencegrid.org/pub/auto/' + host,
+                     'meshconfig.opensciencegrid.org/pub/auto/' + args.hostname,
+                     psconfig_ip + '/pub/auto/' + host,
+                     psconfig_ip + '/pub/auto/' + args.hostname]
+
+    for mesh in valid_meshes:
+        if any(mesh in c_mesh for c_mesh in configured_meshes):
+            io.status = nap.OK
+            io.summary = "Auto-URL configured correctly"
+            print(configured_meshes)
+            return
+
+    for url in configured_meshes:
+        if 'grid-deployment.web.cern.ch' in url:
+            io.status = nap.CRITICAL
+            io.summary = "Static/old URLs found in the mesh config"
+            print(configured_meshes)
+            print_docs()
+            return
+        if 'myosg.grid.iu.edu/pfmesh' in url:
+            io.status = nap.CRITICAL
+            io.summary = "Deprecated auto-URL configured"
+            print(configured_meshes)
+            print("Deprecated auto-URL was found in the list of configured meshes, myosg.grid.iu.edu was retired")
+            print("Please check our documentation for valid entries")
+            print_docs()
+            return
+    io.status = nap.CRITICAL
+    io.summary = "Auto-mesh URL is missing/incorrect"
+    print("The following URL was expected to be found in the mesh config:")
+    print('http://psconfig.opensciencegrid.org/pub/auto/' + host)
+    print("The following was found:")
+    print(configured_meshes)
+    print_docs()
+
+
+@app.metric(metric_name="perfSONAR configuration: contacts", passive=True)
+def test_contacts(args, io):
+    if check_deps(io):
+        return
+    if not app.toolkit_meta['administrator'].get('email'):
+        io.status = nap.CRITICAL
+        io.summary = "Contact information is missing (e-mail)"
+        print_docs()
+    else:
+        io.status = nap.OK
+        io.summary = "Contact and organization found"
+
+
+@app.metric(metric_name="perfSONAR configuration: location", passive=True)
+def test_location(args, io):
+    if check_deps(io):
+        return
+    if not (app.toolkit_meta['location']['longitude'] and app.toolkit_meta['location']['latitude']):
+        io.status = nap.CRITICAL
+        io.summary = "Latitude/Longitude missing"
+        print_docs()
+    else:
+        io.status = nap.OK
+        io.summary = "Location: %s/%s" % (app.toolkit_meta['location']['longitude'],
+                                          app.toolkit_meta['location']['latitude'])
+
+
+@app.metric(metric_name="perfSONAR hardware check", passive=True)
+def test_hw(args, io):
+    if check_deps(io):
+        return
+    if 'host_memory' not in list(app.toolkit_meta.keys()):
+        io.status = nap.UNKNOWN
+        io.summary = "Unable to parse information on installed memory (toolkit version too old ?)"
+        return
+    summary_prefix = ""
+    host_memory = app.toolkit_meta['host_memory']
+    if "is_vm" in list(app.toolkit_meta.keys()) and app.toolkit_meta['is_vm'] != 0:
+        io.status = nap.OK
+        summary_prefix = "VM "
+    elif host_memory < args.target_memory:
+        io.status = nap.CRITICAL
+        summary_prefix = "%sGB RAM (%s required) " % (str(host_memory), str(args.target_memory))
+    else:
+        io.status = nap.OK
+
+    cpus = app.toolkit_meta.get("cpus", "1")
+    cores = app.toolkit_meta.get("cpu_cores", "--")
+    cpu_speed = app.toolkit_meta.get("cpu_speed", "--")
+    print("CPUs: %s" % cpus)
+    print("Cores: %s" % cores)
+    print("CPU speed: %s" % cpu_speed)
+    print("External interface (speed, mtu, ipv4, ipv6, dns):")
+
+    net_speed = 0
+    if 'speed' in list(app.toolkit_meta['external_address'].keys()) and \
+                  not isinstance(app.toolkit_meta['external_address']['speed'], str):
+        io.write(str(app.toolkit_meta['external_address']['speed']) + ', ')
+        net_speed = int(app.toolkit_meta['external_address']['speed'])
+    else:
+        io.write('--, ')
+    io.write(str(app.toolkit_meta['external_address']['mtu']) + ', ')
+    io.write(app.toolkit_meta['external_address']['ipv4_address'] + ', ')
+    io.write(str(app.toolkit_meta['external_address'].get('ipv6_address')) + ', ')
+    io.write(str(app.toolkit_meta['external_address'].get('dns_name')) + ', ')
+    ipv6 = "IPv4 only"
+    if app.toolkit_meta['external_address']['ipv6_address']:
+        ipv6 = "IPv6 enabled"
+
+    io.summary = summary_prefix + "CPU:%s/%scores/%sMhz RAM:%sGB NIC:%sGbps/%sMTU/%s" % (cpus, cores, cpu_speed,
+                                                                                         host_memory,
+                                                                                         str(net_speed / 1000000000),
+                                                                                         app.toolkit_meta[
+                                                                                             'external_address']['mtu'],
+                                                                                         ipv6)
+
+
+if __name__ == '__main__':
+    app.run()
