@@ -1,0 +1,262 @@
+#!/bin/env python3.9
+#
+# check_es -    checks if ElasticSearch contains measurements as configured in the mesh config (PWA) for given host,
+#               i.e. checks freshness of results in ES by looking at the meta-data and comparing them to the list
+#               of tests/tasks defined for the host in the mesh config.
+#               This is a high level functional check, which doesn't query the raw data, it relies on
+#               looking up results in ES. It requires a working instance of mesh-config interface to check what
+#               tests are supposed to be running on a given host.
+#               It reports missing results per mesh (list of missing destinations for uni-directional tests or
+#               list of missing sources for bi-directional tests).
+#
+# Author: Marian Babik
+# Copyright CERN 2024
+#
+
+
+import requests
+import requests.exceptions
+import socket
+import urllib.parse
+import json
+import logging
+
+import nap.core
+from datetime import datetime, timedelta
+from elasticsearch import Elasticsearch
+
+# suppress InsecureRequestWarning: Unverified HTTPS request is being made.
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+
+def get_members_for_type(entry):
+    members = set()
+    if 'members' in entry['members'].keys():
+        for h in entry['members']['members']:
+            members.add(h)
+    if 'a_members' in entry['members'].keys():
+        for h in entry['members']['a_members']:
+            members.add(h)
+    if 'b_members' in entry['members'].keys():
+        for h in entry['members']['b_members']:
+            members.add(h)
+    return members
+
+
+def get_members(mesh_config, event_type):
+    event_type_map = {'packet-trace': 'traceroute',
+                      'packet-loss-rate': 'perfsonarbuoy/owamp',
+                      'histogram-owdelay': 'perfsonarbuoy/owamp',
+                      'throughput': 'perfsonarbuoy/bwctl'}
+    found = False
+    mesh_c = json.loads(mesh_config)
+    for entry in mesh_c['tests']:
+        if 'parameters' in entry.keys() and entry['parameters']['type'] == event_type_map[event_type]:
+            found = True
+            yield entry['description'], get_members_for_type(entry)
+    if not found:
+        raise Exception("Unable to get mesh members for particular event type: %s" % event_type)
+
+
+log = logging.getLogger("nap")
+
+app = nap.core.Plugin(description="Checks metadata in ES wrt. tests configured in the PWA")
+app.add_argument('-T', '--requests-timeout', dest="req_timeout", default=60, type=int,
+                 help='Timeout for HTTP(s) requests')
+app.add_argument('-e', '--event', help='Event type to query (packet-trace, throughput, etc.)')
+app.add_argument('-r', '--timerange', default=7200, type=int, help='Time interval for esmond query')
+app.add_argument('--cred', help='ES basic auth credentials file')
+app.add_argument('-M', '--host-autourl', help="Mesh config auto-URL", dest="autourl")
+app.add_argument('--es', help='Elasticsearch endpoint host:port')
+
+
+@app.metric()
+def test_es_meta(args, io):
+    if not (args.hostname or args.es or args.index):
+        io.status = nap.UNKNOWN
+        io.summary = "Missing plugin arguments"
+        return
+
+    if args.cred:
+        with open(args.cred) as f:
+            es_user = f.readline().strip()
+            es_passwd = f.readline().strip()
+
+    if args.es and ':' in args.es:
+        es_host, es_port = args.es.split(':')
+
+    if not args.autourl:
+        io.status = nap.UNKNOWN
+        io.summary = "Missing auto-url argument"
+        return
+
+    # query ES
+    events_to_index = {'packet-trace': 'ps_trace',
+                      'packet-loss-rate': 'ps_packetloss',
+                      'histogram-owdelay': 'ps_owd',
+                      'throughput': 'ps_throughput',
+                      'ping': 'ps_rtt'}
+    if args.event not in events_to_index.keys():
+        io.status = nap.UNKNOWN
+        io.summary = "Unable to match the given event type to ES index"
+        return
+    es = Elasticsearch([{"host": es_host, "port": int(es_port), 'scheme': 'https'}],
+                       request_timeout=240, basic_auth=(es_user, es_passwd), max_retries=10)
+
+    now = datetime.now()
+    past_time = now - timedelta(seconds=args.timerange)
+
+    query = {
+        "query": {
+            "bool": {
+                "must": [
+                    {"match": {"src_host": args.hostname}},
+                    {
+                        "range": {
+                            "@timestamp": {
+                                "gte": past_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            }
+                        }
+                    }
+                ]
+            }
+        }
+    }
+
+    query2 = {
+    "size": 0,  # Set size to 0 to retrieve only distinct aggregations
+    "aggs": {
+        "unique_dest_ips": {
+            "terms": {"field": "dest_host"},
+            "aggs": {
+                "unique_dest_ip": {"cardinality": {"field": "dest"}}
+            }
+        }
+    },
+    "query": {
+        "bool": {
+            "must": [
+                {"range": {"@timestamp": {"gte": past_time.strftime("%Y-%m-%dT%H:%M:%SZ")}}},
+                {"match": {"src_host": args.hostname}}
+            ]
+        }
+    }
+    }
+    # Execute the search
+    results = es.search(index=events_to_index[args.event], body=query)
+
+    # Extract results
+    extracted_data = []
+    if results['hits']['total']['value'] > 0:
+        for hit in results['hits']['hits']:
+            # Access document source
+            source = hit['_source']
+            # Create a dictionary with extracted fields (modify field names if needed)
+            data = {
+                "dest_host": source.get('dest_host'),
+                "dest_ip": source.get('dest')
+            }
+            extracted_data.append(data)
+        log.debug(results['hits']['total']['value'])
+        log.debug(extracted_data)
+    else:
+        io.status = nap.WARNING
+        io.summary = "No results in ES: {} {} {}".format(args.hostname, args.timerange, args.event)
+        print("No results in central ES for host:{}; time-range: {}; index:{}".format(args.hostname, args.timerange, args.event))
+        return
+
+    # mesh config
+    mesh_url = urllib.parse.urljoin(args.autourl, args.hostname)
+    try:
+        meshes = requests.get(mesh_url+'?format=meshconfig', timeout=args.req_timeout)
+        meshes.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        io.status = nap.UNKNOWN
+        io.summary = "Failed to get mesh from %s" % mesh_url
+        return
+
+    # lookup missing events
+    missing = {}
+    found = set()
+    missing_entries = False
+    for mesh, ev_mem in dict(get_members(meshes.text, args.event)).items():
+        if not ev_mem:
+            io.status = nap.UNKNOWN
+            io.summary = "No members for particular mesh %s and event type: %s" % (mesh, args.event)
+            return
+        # remove localhost
+        if args.hostname in ev_mem:
+            ev_mem.remove(args.hostname)
+        # find missing entries
+        mem_to_check = ev_mem.copy()
+        for member in ev_mem:
+            for entry in extracted_data:
+                # direct tests - remove all dests from mem_to_check that are found in ES
+                if entry['dest_host'] == member and member in mem_to_check:
+                    if 'IPv4' in mesh and ':' not in entry['dest_ip']:   # remove ip4 dsts if ip4 mesh
+                        mem_to_check.remove(member)
+                    elif 'IPv6' in mesh:
+                        if ':' in entry['dest_ip']:   # remove ip6 dests if ip6 mesh
+                            mem_to_check.remove(member)
+                        else:   # host is missing in ip6 mesh, but maybe it's not dual-stacked (missing ip6) ?
+                            try:
+                                host_addr = socket.getaddrinfo(member, 80, 0, 0, socket.IPPROTO_TCP)
+                            except Exception as e:
+                                print("Warning: unable to DNS resolve {member}; skipping")   # what /?
+                                continue
+                            if not filter(lambda x: x[0] == socket.AF_INET6, host_addr):
+                                mem_to_check.remove(member)  # remove as it's ip4-only
+                    elif 'IPv4' not in mesh and 'IPv6' not in mesh:   # mesh has no indication if ip6 or ip4
+                        mem_to_check.remove(member)                   # remove based on hostname match
+        if mem_to_check:
+            missing[mesh + ' (' + args.event + ')'] = mem_to_check
+            missing_entries = True
+            found.update(ev_mem - mem_to_check)
+        else:
+            found.update(ev_mem)
+
+    # found missing events -> warning
+    if missing_entries:
+        missing_count = set()
+        for v in missing.values():
+            missing_count.update(v)
+        comp_rate = round((float(len(found)) / (len(found) + len(missing_count))) * 100, 2)
+        if args.event == 'packet-trace' and comp_rate >= 90:
+            io.status = nap.OK
+        elif args.event == 'throughput' and comp_rate >= 70:
+            io.status = nap.OK
+        elif args.event == 'histogram-owdelay' and comp_rate >= 80:
+            io.status = nap.OK
+        else:
+            io.status = nap.WARNING
+        if comp_rate <= 20:
+            io.status = nap.CRITICAL
+        io.summary = "ES {} % complete for event type: {}".format(comp_rate, args.event)
+        io.add_perf_data("complete", comp_rate, uom="%")
+        io.add_perf_data("total", len(found) + len(missing_count - found))
+        io.add_perf_data("mcount", len(missing_count))
+        io.add_perf_data("wcount", len(found))
+
+        print("Time-range: %d" % args.timerange)
+        print("Even-types checked: %s" % args.event)
+        for k, v in sorted(missing.items()):
+            print("\nMesh (Event-type): %s " % str(k))
+            print("   Missing destinations: %s" % len(v))
+            print("   Missing destinations: %s" % (", ".join(v)))
+            print("\n   Working destinations: %s" % (", ".join(list(found))))
+        print("\nDocumentation for this check can be found at https://opensciencegrid.org/networking/perfsonar/faq/")
+        return
+
+    # no missing events - all ok
+    io.status = nap.OK
+    io.summary = "esmond is complete"
+    io.add_perf_data("complete", 100, uom="%")
+    io.add_perf_data("total", len(found))
+    io.add_perf_data("mcount", 0)
+    io.add_perf_data("wcount", len(found))
+    print("   Working destinations: %s" % (", ".join(list(found))))
+
+
+if __name__ == '__main__':
+    app.run()
