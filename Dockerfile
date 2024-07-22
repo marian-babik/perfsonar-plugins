@@ -26,6 +26,7 @@ RUN sed '1 s|^.*$|#!/usr/bin/env python3.9|' -i /usr/libexec/pscheduler/commands
 # Install
 COPY ./src/check_ps /usr/lib64/nagios/plugins/
 COPY ./src/check_ps_es /usr/lib64/nagios/plugins/
+COPY ./src/check_es /usr/lib64/nagios/plugins/
 COPY ./src/check_ps_psched /usr/lib64/nagios/plugins/
 COPY ./src/check_rsv /usr/lib64/nagios/plugins/
 COPY ./src/check_ps_report /usr/lib64/nagios/plugins/
