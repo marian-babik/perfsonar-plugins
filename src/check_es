@@ -3,8 +3,8 @@
 # check_es -    checks if ElasticSearch contains measurements as configured in the mesh config (PWA) for given host,
 #               i.e. checks freshness of results in ES by looking at the meta-data and comparing them to the list
 #               of tests/tasks defined for the host in the mesh config.
-#               This is a high level functional check, it relies on looking up results in central ES at UC.
-#               It requires a working instance of mesh-config interface to check what
+#               This is a high level functional check, which doesn't query the raw data, it relies on
+#               looking up results in ES. It requires a working instance of mesh-config interface to check what
 #               tests are supposed to be running on a given host.
 #               It reports missing results per mesh (list of missing destinations for uni-directional tests or
 #               list of missing sources for bi-directional tests).
@@ -24,6 +24,7 @@ import logging
 import nap.core
 from datetime import datetime, timedelta
 from elasticsearch import Elasticsearch
+from elasticsearch.helpers import scan
 
 # suppress InsecureRequestWarning: Unverified HTTPS request is being made.
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
@@ -115,7 +116,8 @@ def test_es_meta(args, io):
                     {
                         "range": {
                             "@timestamp": {
-                                "gte": past_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                "gte": "now-{}h".format(round(args.timerange/3600)),
+                                "lt": "now"
                             }
                         }
                     }
@@ -124,47 +126,27 @@ def test_es_meta(args, io):
         }
     }
 
-    query2 = {
-    "size": 0,  # Set size to 0 to retrieve only distinct aggregations
-    "aggs": {
-        "unique_dest_ips": {
-            "terms": {"field": "dest_host"},
-            "aggs": {
-                "unique_dest_ip": {"cardinality": {"field": "dest"}}
-            }
-        }
-    },
-    "query": {
-        "bool": {
-            "must": [
-                {"range": {"@timestamp": {"gte": past_time.strftime("%Y-%m-%dT%H:%M:%SZ")}}},
-                {"match": {"src_host": args.hostname}}
-            ]
-        }
-    }
-    }
     # Execute the search
-    results = es.search(index=events_to_index[args.event], body=query)
+    log.debug(query)
+    results = scan(client=es, index=events_to_index[args.event], query=query, scroll='1h', size=5000)
 
     # Extract results
     extracted_data = []
-    if results['hits']['total']['value'] > 0:
-        for hit in results['hits']['hits']:
-            # Access document source
-            source = hit['_source']
-            # Create a dictionary with extracted fields (modify field names if needed)
-            data = {
-                "dest_host": source.get('dest_host'),
-                "dest_ip": source.get('dest')
-            }
-            extracted_data.append(data)
-        log.debug(results['hits']['total']['value'])
-        log.debug(extracted_data)
-    else:
+    if not results:
         io.status = nap.WARNING
         io.summary = "No results in ES: {} {} {}".format(args.hostname, args.timerange, args.event)
         print("No results in central ES for host:{}; time-range: {}; index:{}".format(args.hostname, args.timerange, args.event))
         return
+
+    for hit in results:
+        # Access document source
+        source = hit['_source']
+        # Create a dictionary with extracted fields (modify field names if needed)
+        data = {
+            "dest_host": source.get('dest_host'),
+            "dest_ip": source.get('dest')
+         }
+        extracted_data.append(data)
 
     # mesh config
     mesh_url = urllib.parse.urljoin(args.autourl, args.hostname)
