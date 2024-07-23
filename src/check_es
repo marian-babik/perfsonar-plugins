@@ -3,8 +3,8 @@
 # check_es -    checks if ElasticSearch contains measurements as configured in the mesh config (PWA) for given host,
 #               i.e. checks freshness of results in ES by looking at the meta-data and comparing them to the list
 #               of tests/tasks defined for the host in the mesh config.
-#               This is a high level functional check, which doesn't query the raw data, it relies on
-#               looking up results in ES. It requires a working instance of mesh-config interface to check what
+#               This is a high level functional check, it relies on looking up results in central ES at UC.
+#               It requires a working instance of mesh-config interface to check what
 #               tests are supposed to be running on a given host.
 #               It reports missing results per mesh (list of missing destinations for uni-directional tests or
 #               list of missing sources for bi-directional tests).
