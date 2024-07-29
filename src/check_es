@@ -226,7 +226,7 @@ def test_es_meta(args, io):
             print("\nMesh (Event-type): %s " % str(k))
             print("   Missing destinations: %s" % len(v))
             print("   Missing destinations: %s" % (", ".join(v)))
-            print("\n   Working destinations: %s" % (", ".join(list(found))))
+        print("\n   Working destinations: %s" % (", ".join(list(found))))
         print("\nDocumentation for this check can be found at https://opensciencegrid.org/networking/perfsonar/faq/")
         return
 
